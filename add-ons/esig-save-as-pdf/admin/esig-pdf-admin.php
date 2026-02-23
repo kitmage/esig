@@ -188,16 +188,20 @@ if (!class_exists('ESIG_PDF_Admin')) :
             $this->invitation = new WP_E_Invite();
             $this->user = new WP_E_User;
 
+            if ($document_id == null) {
+                $document_id = isset($_GET['did']) ? $this->document->document_id_by_csum($_GET['did']) : $_GET['document_id'];
+            }
+
+            if (!$this->can_current_request_download_pdf($document_id)) {
+                status_header(403);
+                return false;
+            }
+
             $pdf = $this->create_pdf_document();
             
            // $pdf->WriteHTML('<h1>Hello world!</h1>');
            // $pdf->Output($pdf_name, 'D');
      
-
-            if ($document_id == null) {
-                $document_id = isset($_GET['did']) ? $this->document->document_id_by_csum($_GET['did']) : $_GET['document_id'];
-            }
-
             if ($document_id) {
                 $doc_id = $document_id;
                 $document = $this->document->getDocumentById($doc_id);
@@ -1085,7 +1089,7 @@ if (!class_exists('ESIG_PDF_Admin')) :
                 exit;
             }
 
-            if (!$this->is_pdf_request_authorized($document_id)) {
+            if (!$this->can_current_request_download_pdf($document_id)) {
                 status_header(403);
                 exit;
             }
@@ -1094,6 +1098,91 @@ if (!class_exists('ESIG_PDF_Admin')) :
        
             $this->pdf_document($document_id,$pdf_name,'D');
             exit;
+        }
+
+        private function can_current_request_download_pdf($document_id) {
+
+            $document_id = absint($document_id);
+            if (empty($document_id)) {
+                return false;
+            }
+
+            $this->document = new WP_E_Document;
+            $document = $this->document->getDocumentById($document_id);
+
+            if (empty($document)) {
+                return false;
+            }
+
+            if (!$this->is_document_available_for_pdf_download($document)) {
+                return false;
+            }
+
+            if (!$this->is_request_actor_allowed_for_pdf_download($document)) {
+                return false;
+            }
+
+            return $this->validate_pdf_request_signature($document_id);
+        }
+
+        private function is_document_available_for_pdf_download($document) {
+
+            $pdf_option = absint($this->getPdfOption($document->document_id));
+            if ($pdf_option === 2) {
+                return false;
+            }
+
+            if ($pdf_option !== 1) {
+                return true;
+            }
+
+            $status = strtolower((string) WP_E_Sig()->document->getStatus($document->document_id));
+            if (in_array($status, array('signed', 'completed'), true)) {
+                return true;
+            }
+
+            return (bool) WP_E_Sig()->document->getSignedresult($document->document_id);
+        }
+
+        private function is_request_actor_allowed_for_pdf_download($document) {
+
+            $document_id = absint($document->document_id);
+
+            if (is_user_logged_in()) {
+                $current_user_id = get_current_user_id();
+
+                if (absint($document->user_id) === $current_user_id || current_user_can('manage_options')) {
+                    return true;
+                }
+
+                $esigrole = new WP_E_Esigrole();
+                if ($esigrole->user_can_view_document($document_id, $current_user_id)) {
+                    return true;
+                }
+
+                if (class_exists('Access_Control_Setting') && method_exists('Access_Control_Setting', 'is_document_access')) {
+                    if (Access_Control_Setting::is_document_access($current_user_id, $document_id)) {
+                        return true;
+                    }
+                }
+            }
+
+            $invite_hash = isset($_GET['invite']) ? sanitize_text_field(wp_unslash($_GET['invite'])) : '';
+            if (empty($invite_hash)) {
+                return false;
+            }
+
+            $invitation = WP_E_Sig()->invite->getInvite_by_invite_hash($invite_hash);
+            if (empty($invitation) || absint($invitation->document_id) !== $document_id) {
+                return false;
+            }
+
+            $checksum = isset($_GET['csum']) ? sanitize_text_field(wp_unslash($_GET['csum'])) : '';
+            if (!empty($checksum) && !hash_equals((string) $document->document_checksum, $checksum)) {
+                return false;
+            }
+
+            return true;
         }
 
         private function resolve_pdf_document_id() {
@@ -1121,37 +1210,7 @@ if (!class_exists('ESIG_PDF_Admin')) :
         }
 
         private function is_pdf_request_authorized($document_id) {
-
-            if (empty($document_id)) {
-                return false;
-            }
-
-            if (is_user_logged_in()) {
-                $esigrole = new WP_E_Esigrole();
-                if ($esigrole->user_can_view_document($document_id, get_current_user_id())) {
-                    return $this->validate_pdf_request_signature($document_id);
-                }
-            }
-
-            $invite_hash = isset($_GET['invite']) ? sanitize_text_field(wp_unslash($_GET['invite'])) : '';
-            if (empty($invite_hash)) {
-                return false;
-            }
-
-            $invitation = WP_E_Sig()->invite->getInvite_by_invite_hash($invite_hash);
-            if (empty($invitation) || absint($invitation->document_id) !== absint($document_id)) {
-                return false;
-            }
-
-            $checksum = isset($_GET['csum']) ? sanitize_text_field(wp_unslash($_GET['csum'])) : '';
-            if (!empty($checksum)) {
-                $document_checksum = $this->document->document_checksum_by_id($document_id);
-                if ($document_checksum !== $checksum) {
-                    return false;
-                }
-            }
-
-            return $this->validate_pdf_request_signature($document_id);
+            return $this->can_current_request_download_pdf($document_id);
         }
 
         private function get_signed_pdf_url($document_id, $checksum = '') {
