@@ -74,7 +74,7 @@ if (!class_exists('ESIG_PDF_Admin')) :
         $csum = WP_E_Sig()->document->document_checksum_by_id($docId);
 
 
-        $pdfurl = add_query_arg(array('esigtodo' => 'esigpdf', 'did' => $csum), WP_E_Sig()->setting->default_link());
+        $pdfurl = $this->get_signed_pdf_url($docId, $csum);
         // 
         if (wp_is_mobile()) {
             $target = 'target="_blank"';
@@ -756,7 +756,7 @@ if (!class_exists('ESIG_PDF_Admin')) :
                 return $more_actions;
             }
 
-            $pdfurl = add_query_arg(array('esigtodo' => 'esigpdf', 'did' => WP_E_Sig()->document->document_checksum_by_id($doc->document_id)), WP_E_Sig()->setting->default_link());
+            $pdfurl = $this->get_signed_pdf_url($doc->document_id);
             if ($doc->document_status == 'signed')
                 $more_actions .= '| <span class="save_as_pdf_link"><a href="' . $pdfurl . '" title="Save as pdf">' . __('Save As PDF', 'esig') . '</a></span>';
 
@@ -780,7 +780,7 @@ if (!class_exists('ESIG_PDF_Admin')) :
             $csum = $this->document->document_checksum_by_id($document_id);
 
 
-            $pdfurl = add_query_arg(array('esigtodo' => 'esigpdf', 'did' => $csum), WP_E_Sig()->setting->default_link());
+            $pdfurl = $this->get_signed_pdf_url($document_id, $csum);
 
 
             // 
@@ -1129,7 +1129,7 @@ if (!class_exists('ESIG_PDF_Admin')) :
             if (is_user_logged_in()) {
                 $esigrole = new WP_E_Esigrole();
                 if ($esigrole->user_can_view_document($document_id, get_current_user_id())) {
-                    return true;
+                    return $this->validate_pdf_request_signature($document_id);
                 }
             }
 
@@ -1151,7 +1151,132 @@ if (!class_exists('ESIG_PDF_Admin')) :
                 }
             }
 
-            return true;
+            return $this->validate_pdf_request_signature($document_id);
+        }
+
+        private function get_signed_pdf_url($document_id, $checksum = '') {
+
+            $document_id = absint($document_id);
+            if ($document_id <= 0) {
+                return '';
+            }
+
+            if (empty($checksum)) {
+                $checksum = WP_E_Sig()->document->document_checksum_by_id($document_id);
+            }
+
+            $identity = $this->get_pdf_token_identity();
+            $timestamp = time();
+            $uid = $identity['uid'];
+
+            $args = array(
+                'esigtodo' => 'esigpdf',
+                'did' => $checksum,
+                'ts' => $timestamp,
+                'uid' => $uid,
+                'sig' => $this->generate_pdf_signature($checksum, $uid, $timestamp),
+            );
+
+            if (!empty($identity['invite'])) {
+                $args['invite'] = $identity['invite'];
+            }
+
+            if (!empty($identity['csum'])) {
+                $args['csum'] = $identity['csum'];
+            }
+
+            return add_query_arg($args, WP_E_Sig()->setting->default_link());
+        }
+
+        private function validate_pdf_request_signature($document_id) {
+
+            if (!$this->is_signed_pdf_url_required()) {
+                return true;
+            }
+
+            $ts = isset($_GET['ts']) ? absint(wp_unslash($_GET['ts'])) : 0;
+            $uid = isset($_GET['uid']) ? sanitize_text_field(wp_unslash($_GET['uid'])) : '';
+            $sig = isset($_GET['sig']) ? sanitize_text_field(wp_unslash($_GET['sig'])) : '';
+
+            if ($ts <= 0 || empty($uid) || empty($sig)) {
+                return false;
+            }
+
+            $max_age = absint(apply_filters('esig_pdf_signed_url_ttl', 300));
+            if (empty($max_age)) {
+                $max_age = 300;
+            }
+
+            $current_time = time();
+            if ($ts > ($current_time + 60) || ($current_time - $ts) > $max_age) {
+                return false;
+            }
+
+            $document_checksum = $this->document->document_checksum_by_id($document_id);
+            $expected_sig = $this->generate_pdf_signature($document_checksum, $uid, $ts);
+
+            if (!hash_equals($expected_sig, $sig)) {
+                return false;
+            }
+
+            return $this->is_pdf_identity_valid_for_request($uid);
+        }
+
+        private function is_signed_pdf_url_required() {
+            return (bool) apply_filters('esig_pdf_require_signed_urls', true);
+        }
+
+        private function is_pdf_identity_valid_for_request($uid) {
+
+            if (is_user_logged_in()) {
+                $expected_uid = 'user:' . get_current_user_id();
+                return hash_equals($expected_uid, $uid);
+            }
+
+            $invite_hash = isset($_GET['invite']) ? sanitize_text_field(wp_unslash($_GET['invite'])) : '';
+            if (!empty($invite_hash)) {
+                $expected_uid = 'invite:' . $invite_hash;
+                return hash_equals($expected_uid, $uid);
+            }
+
+            return false;
+        }
+
+        private function generate_pdf_signature($document_checksum, $uid, $timestamp) {
+            $payload = implode('|', array($document_checksum, $uid, absint($timestamp)));
+            return hash_hmac('sha256', $payload, $this->get_pdf_signature_secret());
+        }
+
+        private function get_pdf_signature_secret() {
+            return hash('sha256', wp_salt('auth') . '|' . wp_salt('secure_auth') . '|esig-pdf-signed-url');
+        }
+
+        private function get_pdf_token_identity() {
+
+            if (is_user_logged_in()) {
+                return array(
+                    'uid' => 'user:' . get_current_user_id(),
+                    'invite' => '',
+                    'csum' => '',
+                );
+            }
+
+            $invite_hash = isset($_GET['invite']) ? sanitize_text_field(wp_unslash($_GET['invite'])) : '';
+            $checksum = isset($_GET['csum']) ? sanitize_text_field(wp_unslash($_GET['csum'])) : '';
+
+            if (!empty($invite_hash)) {
+                return array(
+                    'uid' => 'invite:' . $invite_hash,
+                    'invite' => $invite_hash,
+                    'csum' => $checksum,
+                );
+            }
+
+            return array(
+                'uid' => 'guest:anonymous',
+                'invite' => '',
+                'csum' => '',
+            );
         }
 
         private function create_pdf_document() {
