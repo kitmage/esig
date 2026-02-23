@@ -813,12 +813,22 @@ if (!class_exists('ESIG_PDF_Admin')) :
          */
 
         public function esig_frontend_pdf_save() {
-            $esigtodo = isset($_GET['esigtodo']) ? $_GET['esigtodo'] : null;
-            if (isset($esigtodo)) {
-                $this->save_as_pdf_content();
-            } else {
+            if (!isset($_GET['esigtodo']) || $_GET['esigtodo'] !== 'esigpdf') {
                 return;
             }
+
+            $document_id = $this->resolve_pdf_document_id();
+            if (!$document_id) {
+                status_header(400);
+                exit;
+            }
+
+            if (!$this->is_pdf_request_authorized($document_id)) {
+                status_header(403);
+                exit;
+            }
+
+            $this->save_as_pdf_content($document_id);
         }
 
         public function pdf_misc_settings($template_data) {
@@ -1066,14 +1076,82 @@ if (!class_exists('ESIG_PDF_Admin')) :
         public function save_as_pdf_content($document_id = null) {
 
             $this->document = new WP_E_Document;
-            if ($document_id == null) {
-                $document_id = isset($_GET['did']) ? $this->document->document_id_by_csum($_GET['did']) : $_GET['document_id'];
+            if ($document_id === null) {
+                $document_id = $this->resolve_pdf_document_id();
+            }
+
+            if (!$document_id) {
+                status_header(400);
+                exit;
+            }
+
+            if (!$this->is_pdf_request_authorized($document_id)) {
+                status_header(403);
+                exit;
             }
 
             $pdf_name = $this->pdf_file_name($document_id) . ".pdf";
        
             $this->pdf_document($document_id,$pdf_name,'D');
             exit;
+        }
+
+        private function resolve_pdf_document_id() {
+
+            $this->document = new WP_E_Document;
+
+            if (isset($_GET['did'])) {
+                $checksum = sanitize_text_field(wp_unslash($_GET['did']));
+                $document_id = absint($this->document->document_id_by_csum($checksum));
+
+                if ($document_id > 0) {
+                    return $document_id;
+                }
+            }
+
+            if (isset($_GET['document_id'])) {
+                $document_id = absint(wp_unslash($_GET['document_id']));
+
+                if ($document_id > 0 && $this->document->getDocumentById($document_id)) {
+                    return $document_id;
+                }
+            }
+
+            return 0;
+        }
+
+        private function is_pdf_request_authorized($document_id) {
+
+            if (empty($document_id)) {
+                return false;
+            }
+
+            if (is_user_logged_in()) {
+                $esigrole = new WP_E_Esigrole();
+                if ($esigrole->user_can_view_document($document_id, get_current_user_id())) {
+                    return true;
+                }
+            }
+
+            $invite_hash = isset($_GET['invite']) ? sanitize_text_field(wp_unslash($_GET['invite'])) : '';
+            if (empty($invite_hash)) {
+                return false;
+            }
+
+            $invitation = WP_E_Sig()->invite->getInvite_by_invite_hash($invite_hash);
+            if (empty($invitation) || absint($invitation->document_id) !== absint($document_id)) {
+                return false;
+            }
+
+            $checksum = isset($_GET['csum']) ? sanitize_text_field(wp_unslash($_GET['csum'])) : '';
+            if (!empty($checksum)) {
+                $document_checksum = $this->document->document_checksum_by_id($document_id);
+                if ($document_checksum !== $checksum) {
+                    return false;
+                }
+            }
+
+            return true;
         }
 
         private function create_pdf_document() {
